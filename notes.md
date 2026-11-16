@@ -62,3 +62,59 @@ To be accurate about this app: even without the check, login would still have fa
 - Signup returns "Email is already registered", which does reveal that an email exists. Login avoids this leak, but signup trades privacy for usability.
 
 ######################################################################
+
+## Part 2: Profiles and the connection request model
+
+### Q1. Why an allowed-fields list that rejects unknown fields, instead of passing `req.body` to the model? What would `{"emailId":"hacker@example.com"}` have done without it?
+
+Passing `req.body` straight to the model is called mass assignment. The client decides which fields change, so any field the model has becomes editable by anyone logged in. My route only accepts the names in `EDITABLE_FIELDS` and rejects the whole request if any other key is present.
+
+What the three attack requests would have done without the list:
+- `{"emailId":"hacker@example.com"}` would have replaced my account's email. Email is the account's identity, so I could claim an address I don't own, and any later feature built on email (password reset, verification) would trust it. The unique index would only stop me from taking an address that is already registered.
+- `{"password":"hacked"}` would have been stored as plain text. Hashing happens in my service code, not in the schema, so the model would have saved whatever string it received. That gives a plaintext password in the database, and I would be locked out, since `bcrypt.compare` against a non-hash fails.
+- `{"firstName":"Hacker","isAdmin":true}`: in this app, Mongoose's strict mode would silently drop `isAdmin`, because the schema has no such field. That protection is accidental. The day someone adds a `role` or `isAdmin` field, the same request would become privilege escalation, so the allowlist is what keeps it safe.
+
+My step 5 results: all three returned HTTP 400 with `These fields cannot be edited: emailId` (and `password`, `isAdmin`). Step 7 then showed the profile unchanged. The `isAdmin` request had a valid `firstName` in it, and nothing was applied, because the whole request was rejected and not partly applied.
+
+Rejecting is better than silently ignoring unknown fields. A client that sends a wrong field name finds out immediately, and attacks leave an obvious trace.
+
+An allowlist is better than a blocklist (listing the forbidden fields), because a blocklist fails open: any new sensitive field is editable until someone remembers to add it. An allowlist fails closed.
+
+The same route also type-checks each field (`age` must be a number, so `"21"` is rejected), caps lengths, removes duplicate skills (`node.js` collapsed into `Node.js`), and allows only `http` and `https` photo URLs (so `javascript:alert(1)` was rejected).
+
+### Q2. Why edit with `set()` and `save()` instead of `findByIdAndUpdate`?
+
+`findByIdAndUpdate` sends the update straight to MongoDB and skips most of Mongoose's document logic:
+- **Validators don't run by default.** They run only if I pass `runValidators: true`, and it's easy to forget.
+- **Update validators behave differently.** In a custom validator, `this` is the query and not the document, so a cross-field rule like my "toUserId must not equal fromUserId" can't be written the same way (the `ConnectionRequest` model relies on this).
+- **Document middleware doesn't run.** `pre("save")` hooks never fire for update queries.
+
+With `set()` and `save()`, Mongoose applies the changes to a real document, validates the final state against the whole schema, runs the hooks, and writes only the modified fields. I then return the saved document, so the response is exactly what is stored.
+
+It costs nothing extra here, because `requireAuth` already loaded the user, so `req.user` is a document. There's no second read. The one downside is a lost-update race: if two edits change the same field at the same moment, the last write wins. For a personal profile that's acceptable, and for something like a balance I'd use an atomic update with a condition.
+
+### Q3. Why a unique compound index when the code could check for an existing request first?
+
+A check followed by an insert has a race window. If A's request is sent twice at nearly the same moment (a double click, a retry), both requests can run the check before either has inserted. Both see "no existing request", both insert, and I end up with two rows. The check and the insert are two separate steps, and the database can interleave other requests between them.
+
+A unique index is enforced inside the database as part of the insert itself, so there's no gap. One insert wins and the other fails with error code 11000, even if both arrive in the same instant. In my model check, the second A to B request was rejected with `code 11000`.
+
+So the right design uses both: the pre-check in the service gives a friendly message in the normal case, and the index guarantees correctness in the racing case.
+
+Two follow-ups I noted:
+- The index blocks A to B twice but not B to A after A to B. My script printed `PASS reverse request B->A is NOT blocked by the index`, which shows the gap. Part 3's service must check both directions. Two users sending to each other at exactly the same moment could still slip through, and fully closing that would take a canonical pair key (for example the two ids sorted) with its own unique index.
+- My error handler currently maps code 11000 to "Email is already registered". For a duplicate request that message would be wrong, so Part 3 has to catch 11000 in the request service and return a proper message.
+
+### Q4. Why add a second index on `{ toUserId, status }`, and which query does it serve?
+
+MongoDB answers a query by scanning the whole collection unless an index fits it. The common question in this app is "which requests were sent to me, with status X?", meaning find where `toUserId` is me and `status` is `interested`. That is the pending-requests screen, and it will also serve the accepted-connections list (where I'm the receiver). The index stores requests ordered first by receiver and then by status, so MongoDB jumps straight to my entries. Without it, every such call would be O(n) over all requests in the system, getting slower as the app grows.
+
+The unique index on `(fromUserId, toUserId)` already serves "requests I sent", because `fromUserId` is its first field (a compound index can answer queries on its leading fields). That leaves `toUserId` queries uncovered, which is the gap the second index fills. Together they will also help the Part 4 feed, which needs everyone I've interacted with in either direction.
+
+The order matters: `toUserId` is first because queries always specify it, and `status` second so it can narrow further. A query filtering only on `status` couldn't use this index well. The cost is slightly slower writes and extra storage for every insert, which is a good trade for a read-heavy screen.
+
+### Evidence from my runs
+
+- Edit with valid data returned 200, and the duplicate skill `node.js` was dropped: `["C++","Node.js","MongoDB"]`. The data persisted on the next view.
+- Rejected edits (all 400): `emailId`, `password` and `isAdmin` not editable, empty body, age 17, age `"21"`, gender `robot`, `javascript:` photo URL, skills as a string, 11 skills. Not logged in gave 401. Afterwards the profile was unchanged.
+- Password change: wrong current password 400, weak new password 400, same password 400, then 200. The old password returned 401 on login and the new one returned 200. I changed it
