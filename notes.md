@@ -117,4 +117,60 @@ The order matters: `toUserId` is first because queries always specify it, and `s
 
 - Edit with valid data returned 200, and the duplicate skill `node.js` was dropped: `["C++","Node.js","MongoDB"]`. The data persisted on the next view.
 - Rejected edits (all 400): `emailId`, `password` and `isAdmin` not editable, empty body, age 17, age `"21"`, gender `robot`, `javascript:` photo URL, skills as a string, 11 skills. Not logged in gave 401. Afterwards the profile was unchanged.
-- Password change: wrong current password 400, weak new password 400, same password 400, then 200. The old password returned 401 on login and the new one returned 200. I changed it
+- Password change: wrong current password 400, weak new password 400, same password 400, then 200. The old password returned 401 on login and the new one returned 200. I changed it.
+
+######################################################################
+
+## Part 3: Connection request flow
+
+### Q1. Why is the review a single `findOneAndUpdate` with the status in the filter, instead of reading the request, checking it, and calling `save()`? Use your test 10 result.
+
+Read, check, then save is three steps, and other requests can run between them. If two reviews arrive at the same moment (Bob taps Accept in one tab and Reject in another, or a client retries), both read the request while it is still `interested`, both pass the check, and both write. The last write wins, both callers are told "success", and the final state can disagree with the response one of them received. By default, Mongoose's `save()` also doesn't detect this: for a plain field change it sends an update filtered only by `_id`, so it overwrites silently.
+
+My version puts the rule in the database operation. The filter is `{ _id, toUserId: me, status: "interested" }`, and the update sets the new status. MongoDB applies a single-document update atomically, so checking the filter and changing the status are one indivisible step. Once one update has moved the status away from `interested`, every other update's filter no longer matches, and it returns `null`. The code then reads the document only to choose an error message and returns 409. That follow-up read can't change any data, so it doesn't need to be atomic.
+
+Test 10 sent 10 reviews at the same moment on Carol's request, five `accepted` and five `rejected`. Result: exactly one `200` and nine `409`. Afterwards Bob's connections listed Carol, so `accepted` had won, which matches the one request that got a success response. Ownership (`toUserId: me`) sits in the same filter, so authorization is checked atomically too, and the whole thing costs one database round trip.
+
+### Q2. Why does reviewing someone else's request, or an `ignored` one, return 404 and not 403 or 409? What would leak otherwise?
+
+A 403 ("exists, but not yours") or a different message for an ignored request would tell the caller something they shouldn't know. A 404 makes "doesn't exist", "isn't yours" and "was ignored" look identical.
+
+- **Someone else's request:** request ids are MongoDB ObjectIds, which contain a timestamp and counter and are not secret. If a 403 existed, anyone could probe ids and learn which ones are real requests. With 404, probing reveals nothing. In test 6, Tarun trying to review his own request to Bob got `404 Request not found`, the same answer as a nonexistent id.
+- **An ignored request:** an `ignored` request is a private swipe. If reviewing it returned 409 ("already ignored"), the person who was ignored could discover that someone swiped past them. In test 6, Carol reviewing the request Tarun had ignored got `404 Request not found`. Test 5 showed the other half of the same rule: Carol's received list had `count: 0`, because ignores never appear to the other side.
+
+The 409 is reserved for cases where telling the caller is harmless. If Bob's own request is already `accepted` or `rejected`, he made that decision himself (test 7 returned `This request was already accepted`).
+
+### Q3. The send route checks for an existing request first and also relies on the unique index. What does each handle? Use your test 3 and test 9 results.
+
+**The pre-check** handles the normal, one-at-a-time case with a clear message, and it covers things the index can't:
+- It checks both directions. The unique index only matches the same sender and receiver, so Bob sending to Tarun after Tarun sent to Bob is a different pair as far as the index is concerned. In test 3, Bob's request got `409 A request between you and this user already exists`, which only the pre-check could produce.
+- That message is deliberately vague, so Bob can't tell whether Tarun showed interest or ignored him.
+- It also validates before inserting: no self-requests (`400`), target must exist (`404`), valid id format (`400`), valid status (`400`).
+
+**The unique index** handles concurrency. The check followed by the insert has a gap: ten identical sends can all pass the check before any insert finishes. The index is enforced inside the insert itself, so one insert wins and the rest fail with error code 11000. The service turns that into the same clean 409 and no 500 is ever returned. Test 9 sent 10 identical requests from Carol to Bob at the same moment: exactly one `201` and nine `409`, and Bob's received list showed a single request from Carol.
+
+One honest limit of that evidence: both layers answer with the same 409 and the same message, so the status codes alone don't show which layer rejected which request. 
+
+### Q4. Which race is still not closed by the code, and how would you close it?
+
+Two users sending to each other at the same instant. If A sends to B while B sends to A, both pre-checks find nothing, and both inserts pass the unique index, because (A, B) and (B, A) are different pairs. The result is two rows for one pair, which can leave the app in an inconsistent state: both users pending, neither seeing a match, or an accept applied to one row while the other stays open. The Part 2 model check showed the index doesn't block the reverse direction. I have not reproduced this race through the API, because the timing window is tiny. This is reasoned from the code and the index definition.
+
+The fix is a canonical pair key. Add a `pairKey` field set to the two user ids sorted and joined, for example the smaller id, an underscore, then the larger id, so A to B and B to A produce the same key. Put a unique index on `pairKey`. The database then rejects the second insert whatever the direction, and the existing 11000 handling turns it into a 409. The trade-offs: it needs a backfill for existing rows before the index can be created (existing duplicates would make index creation fail), and a pair can then have only one request row, so the "who sent it" information must stay in `fromUserId` and `toUserId`.
+
+Smaller gaps I noticed: the "target exists" check and the insert aren't atomic, so a user deleted in between could leave an orphaned request (the list code skips such rows). There's also no way to change a decision. An ignored user can't later be marked interested, and an accepted connection can't be removed.
+
+### Evidence from my runs
+
+- Send: `201` for a valid request. Rejections: duplicate `409`, reverse direction `409`, self `400`, unknown user `404`, bad id `400`, bad status `400`, not logged in `401`.
+- Privacy: Carol's received list was empty after being ignored. Bob's received list showed Tarun's card (name, age, about, skills, photo) with no `emailId`.
+- Review: Carol (not the receiver) got `404`, Tarun (the sender) got `404`, an invalid status gave `400`, a bad id gave `400`. Bob accepted with `200`, then two further attempts, accept again and reject, both returned `409`.
+- Connections: Tarun saw Bob and Bob saw Tarun, each seeing the other person's card with no email.
+- Race test 9 (10 simultaneous sends): 1 x `201`, 9 x `409`, one request in Bob's list.
+- Race test 10 (10 simultaneous reviews, accept vs reject): 1 x `200`, 9 x `409`. Carol ended up in Bob's connections, so accepted won.
+
+### Limitations
+
+- Opposite-direction simultaneous sends can still create two rows (Q4).
+- Decisions are final: no un-ignore, no removing a connection.
+- Lists are capped at 100 and aren't paginated yet .
+- No rate limiting on sending requests .

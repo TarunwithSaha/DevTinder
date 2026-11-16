@@ -13,11 +13,16 @@ function errorHandler(err, req, res, next) {
     status = err.statusCode;
     message = err.message;
   } else if (err.code === 11000) {
-    status = 409;                                   // duplicate key from the unique index
-    message = "Email is already registered";
+    // Duplicate key. Say which kind, instead of assuming it is always an email.
+    status = 409;
+    const field = Object.keys(err.keyPattern || {})[0];
+    message = field === "emailId" ? "Email is already registered" : "That record already exists";
   } else if (err.name === "ValidationError") {
-    status = 400;                                   // Mongoose schema validation
+    status = 400;
     message = Object.values(err.errors).map((e) => e.message).join(", ");
+  } else if (err.name === "CastError") {
+    status = 400;
+    message = "Invalid id or value format";
   } else if (err.type === "entity.parse.failed") {
     status = 400;
     message = "Request body is not valid JSON";
