@@ -245,3 +245,72 @@ Weaker signals such as response timing and sizes remain, but the feed disappeara
 - Ordering is by account age, so there is no ranking by shared skills.
 - The ignore leak described above is still open.
 - Connections are ordered by when the request was created, not when it was accepted, because the cursor needs a unique, stable sort key.
+
+#####################################################################################################
+
+## Part 5: Tests, rate limiting, security headers, docs and CI
+
+### Q1. Why test against an in-memory MongoDB and not mock the database? What would the race tests have proven with a mock?
+
+A mock replaces the database with code I write, so it can only confirm my own assumptions about how MongoDB behaves. The behaviors this project depends on are exactly the ones a mock would fake:
+- **Unique indexes.** A mock returns whatever I tell it to, so a duplicate insert would never fail with error code 11000 unless I programmed that in.
+- **Atomic updates.** `findOneAndUpdate` with a filter is atomic inside MongoDB. A mock just returns a value, so there is no atomicity to test.
+- **Schema rules.** Validators, casting an invalid id into a `CastError`, `select: false` on the password and `populate` all live in Mongoose and the database.
+
+With a mock, the race tests would have proven nothing. "Ten identical sends create one request" would pass or fail according to how I wrote the mock, and could never fail because of a real concurrency bug.
+
+`mongodb-memory-server` starts a real MongoDB process in memory. The tests build the real indexes (`Model.init()` in `helpers.js`), wipe the data between tests while keeping the indexes, and talk to the actual engine. The costs are a slower suite (about 30 seconds locally, and a first-run download of the MongoDB binary) and a limit on realism: it is a single in-memory server, not Atlas, so it has no network latency, no replica set and no cluster behavior. GitHub Actions ran the whole suite in 42 seconds.
+
+### Q2. What do the two "ten at the same moment" tests prove, and what can they not prove? What happened when I removed the status from the review filter?
+
+**What they prove:** the requests are sent together (`Promise.all`) to one app instance, so they interleave on the event loop and reach the real database at overlapping times. With the code as written, ten identical sends produced one `201` and nine `409`, with exactly one row stored. Ten competing accept and reject reviews produced exactly one `200` and nine `409`, and the stored status matched the one response that said success. Those are the intended guarantees from the unique index and the conditional atomic update.
+
+**What they cannot prove:**
+- A passing race test cannot prove there is no race. Timing can hide a bug on one run. A failing run proves a bug, but a passing one only shows that this run did not hit it.
+- The two layers give the same answer. In the duplicate-send test, both the pre-check and the unique index return the same 409, so the test cannot tell which layer rejected a request.
+- It covers one Node process against one database. It does not cover several server instances, although the atomicity lives in MongoDB, so it should hold there too.
+- It doesn't cover the opposite-direction race (A and B sending to each other at the same instant), which is a known open limitation.
+
+**Break-on-purpose result:** I removed `status: "interested"` from the review filter and ran `tests/connections.test.js`. Three tests failed and 14 passed:
+- "an ignored request cannot be reviewed" got `200` where it expected `404`.
+- "a decision is final" got `200` where it expected `409`.
+- The race test received 10 successful reviews where it expected 1 (`Expected length: 1, Received length: 10`).
+
+After restoring the line, all 17 tests passed again.
+
+An honest reading: that mutation breaks the rule even when requests come one at a time, which is why the sequential tests failed too. So this experiment shows the suite catches that bug, but it does not show that the race test alone detects a concurrency-only bug. A stronger check would be to replace the atomic update with read, check, then `save()`: it passes every sequential test and can only fail under concurrency.
+
+One lesson from the commit: my edit left a commented-out copy of the bug in the committed file. `git status` only lists changed files, so it didn't show it. `git diff` showed it, and I removed it in a follow-up commit. From now on I run `git diff --staged` before committing.
+
+### Q3. Why does the login limiter count only failed attempts, and what are the limits of an in-memory, per-IP limiter?
+
+The limiter uses `skipSuccessfulRequests: true`, so only failed attempts use up the budget. A normal user who logs in correctly is never locked out, while someone guessing passwords burns through the limit quickly. The tests confirm both sides: with a limit of 3, three wrong passwords were rejected with `401`, the fourth got `429`, and even the correct password got `429` while the limit was active. Six successful logins in a row with the same limit all returned `200`. By hand, with the real limit of 10 per 15 minutes, twelve wrong logins gave ten `401`s and then `429 429`.
+
+Limits of this design:
+- **Per IP, not per account.** An attacker with many IP addresses can spread guesses and stay under the limit, and many honest users behind one shared address (an office or a campus) share one budget. Limiting per account would stop distributed guessing but lets anyone lock a victim out by failing on purpose.
+- **In memory.** The counters reset when the server restarts, and each server instance keeps its own, so N instances allow N times the limit. A shared store such as Redis fixes both.
+- **`TRUST_PROXY` has to be right.** Behind a hosting proxy, the real client is in the `X-Forwarded-For` header. If Express doesn't trust the proxy, every request appears to come from the proxy's address, so all users share one budget. In Codespaces I saw exactly this: `express-rate-limit` logged `ERR_ERL_UNEXPECTED_X_FORWARDED_FOR`. If I trust the header when no proxy exists, or trust too many hops, a client can invent that header and rotate fake addresses to dodge the limit. So the setting must equal the real number of proxies in front of the app: `1` on Render, unset locally.
+
+### Q4. Name differences between my development and production setups, and why each matters.
+
+1. **`JWT_SECRET`.** Production gets its own newly generated random secret, never reused from development. Whoever knows the secret can forge a login token for any user. Development secrets get printed in terminals and pasted around, so they have to be treated as exposed. If production used the same value, a development leak would compromise the live app.
+2. **Database user and database.** Production uses a separate Atlas user with `readWrite` on only the `devtinder_prod` database, instead of the development user on `devtinder`. Tests, the seed script and its `--clean` option can never touch real data, and a leaked development credential cannot read or delete production.
+3. **Cookie flags (`NODE_ENV=production`).** In production the login cookie is marked `Secure`, so the browser sends it only over HTTPS and it cannot be read on a plain-HTTP network. It stays off in development, because the cookie would never be sent to `http://localhost`. `httpOnly` and `sameSite: "lax"` are on in both.
+4. **`TRUST_PROXY=1`.** Needed behind the hosting proxy so the rate limiter sees real client addresses (see Q3). Leaving it off locally avoids trusting a header nobody should be setting.
+5. **Network access to the database.** In development, Atlas allows access from anywhere (`0.0.0.0/0`), because Codespaces addresses change. That is only acceptable with a strong password and no sensitive data. A hosting platform without a fixed outbound address has the same constraint, so the database password and the user's privileges are what protect the data, and the least-privilege user in point 2 matters even more.
+
+### Evidence from my runs
+
+- `npm test`: 5 suites passed, 87 tests passed.
+- Coverage: 93.56% statements, 84.03% branches, 96.61% functions, 94.3% lines. The gaps are `src/config/database.js` (0%, because the tests connect to the in-memory database directly and never run the real startup code), `errorHandler.js` (78.57% statements) and `profileValidation.js` (83.33% statements).
+- GitHub Actions: workflow `tests`, run #1 on commit `ba0cb2a`, green, 42 seconds.
+- Response headers on `/health` include `Content-Security-Policy`, `Strict-Transport-Security`, `X-Content-Type-Options: nosniff` and `X-Frame-Options`, and `X-Powered-By` is absent.
+- Login rate limit: ten `401` responses and then `429 429`.
+- The rate limiter logged `ERR_ERL_UNEXPECTED_X_FORWARDED_FOR` in Codespaces until `TRUST_PROXY` was set to `1`.
+
+### Limitations
+
+- The rate limiter is per IP and in memory (Q3).
+- Race tests cannot prove the absence of a race (Q2). The opposite-direction send race is still open.
+- `database.js` and some error branches are not covered by tests.
+- A stolen token stays valid until it expires, even after a password change.
