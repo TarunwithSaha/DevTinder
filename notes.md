@@ -174,3 +174,74 @@ Smaller gaps I noticed: the "target exists" check and the insert aren't atomic, 
 - Decisions are final: no un-ignore, no removing a connection.
 - Lists are capped at 100 and aren't paginated yet .
 - No rate limiting on sending requests .
+
+######################################################################
+
+## Part 4: Feed, pagination and error handling
+
+### Q1. Why cursor pagination and not `skip`/`limit`? What happens to someone walking pages of a feed that changes while they swipe?
+
+`skip(n)` means "ignore the first n results of the query as it is right now". The feed isn't a fixed list. Every swipe removes that person from it, and new signups appear at the top, because the feed is newest first. So "the first n" keeps changing under the reader.
+
+- **Swiping removes rows, so skip jumps over people.** Say page 1 shows users 1 to 7 and I swipe on all seven. They leave the feed, so old user 8 is now first. Page 2 with `skip=7` then skips old users 8 to 14, and I never see them.
+- **New signups add rows, so skip repeats people.** If three users join at the top while I read page 1, everything shifts down by three, and `skip=7` shows the last three people of page 1 again.
+- **Cost.** MongoDB has to walk past every skipped row. The feed query also filters with `$nin`, so deep pages get slower and slower.
+
+A cursor anchors to a position and not a count. My query asks for `_id < lastSeenId`, sorted by `_id` descending. Removing someone doesn't move that position, and new signups have larger ids, so they sit above the cursor and can't appear in a later page. There are no gaps and no repeats, and the `_id` index makes every page equally cheap. `_id` is also unique, so the order never ties. A sort on something like `createdAt` could produce equal values and break the cursor.
+
+Tests 5 and 7 check this from two sides. Test 5 walks the whole feed with `limit=7` and counts the ids and the duplicates, so it catches any gap or repeat in a static feed. Test 7 swipes on someone and confirms they disappear from the feed, which is the "feed changes while you swipe" situation that makes skip unsafe.
+
+### Q2. Why fetch `limit + 1` rows? Why must `nextCursor` be the last returned row's id and not the extra row's id?
+
+The extra row answers "is there another page?" without a second `count` query. A count would cost another round trip and could disagree with the data if the feed changed in between. If `limit + 1` rows come back, there is more, and I return only `limit` of them. If I fetched exactly `limit` rows, I couldn't tell "this was the last page" from "this page is full". I would either need a count or I'd end with an empty last page. With the extra row, a full last page correctly gets `nextCursor: null`.
+
+The cursor must be the id of the last row I actually returned, because the next request uses a strict `$lt` ("older than the cursor"):
+- Cursor = id of the last returned row: the next page starts with the extra row, which is the very next person.
+- Cursor = id of the extra row: `$lt` excludes it, so that person is never shown, at every page boundary.
+
+So with the wrong cursor, a feed of 25 users read 7 at a time would lose one person at each of the 3 page boundaries and show only 22. The page-walk test in test 5 exists to catch exactly that kind of loss. It counts ids across all pages and expects every user exactly once.
+
+### Q3. What would `?cursor[$ne]=x` have done without the string check? Why must `limit` be checked too?
+
+Express's query parser turns `cursor[$ne]=x` into an object, `{ cursor: { $ne: "x" } }`, and `?limit=1&limit=2` into an array. If that object reached the query, my filter would become `_id: { $lt: { $ne: "x" } }`, a client-supplied operator inside a database filter. That is NoSQL injection, the same family as the `{"$ne":null}` login attack from Part 1.
+
+To be precise about this code: `_id` is an ObjectId path, so Mongoose would most likely try to cast the object to an ObjectId, fail with a `CastError`, and return a 400 through my handler. I haven't tested that by removing the check, so I won't claim it as fact. I wouldn't rely on it, because the protection would be an accident of casting. The same value in an aggregation, a `.lean()` raw query, or a string-typed field isn't cast, and an operator object there is taken literally. So my check allows only a plain string of exactly 24 hex characters, and anything else is rejected before a query exists.
+
+Test 6 sends ten bad values (`limit=0`, `51`, `abc`, `5.5`, empty, repeated, `limit[$gt]=0`, `cursor=abc`, `cursor[$ne]=x`, and a 25-character cursor) and expects every one to come back as a 400. It also checks that a correctly formatted but unmatched cursor (`000000000000000000000000`) gets a normal empty page, because nothing is older than the smallest possible id.
+
+`limit` needs a check because it sets how much work one request can cause:
+- With no upper bound, `limit=1000000` would load a million documents into memory, so a single request could slow the server for everyone.
+- `limit=abc` becomes `NaN`, and `limit[$gt]=0` or a repeated parameter isn't a number at all, so the query would error or misbehave.
+- In MongoDB `limit(0)` means "no limit", and a negative limit has its own odd meaning. A client controlling the number could use those special values.
+
+So `limit` must match `^\d{1,3}$`, be between 1 and 50, and default to 10.
+
+### Q4. The feed hides people in both directions. What does test 8 show about what I can work out about other users, and how can the leak be closed?
+
+The feed hides everyone I share a request with, whoever sent it and whatever its status. That includes people who ignored me. Test 8 makes a seed user ignore Tarun and then checks Tarun's feed and received list. The feed no longer shows that user, and the received list doesn't either, because ignores are never shown to the person who was ignored.
+
+That gap is a signal. Someone who vanished from my feed, whom I didn't swipe on, and who isn't in my received list or connections, can only be a person who ignored me. A user who compares two snapshots of their feed could read other people's private swipes. So the Part 3 promise that an ignore is invisible to the other person is broken by the feed.
+
+The send route has the same leak. If Bob tries to send to Tarun after Tarun ignored him, Bob gets `409 A request between you and this user already exists`. My Part 3 note said that message was vague so Bob couldn't tell interest from an ignore. That only hides the type of request. An interested request would show up in Bob's received list, so a 409 with nothing in that list still implies an ignore.
+
+How to close it:
+1. **Feed:** hide only people I have swiped on, people I'm connected to, and people who sent me a visible request. Keep people who ignored me in my feed as if nothing happened.
+2. **Send:** when I swipe on someone who ignored me, return a normal success and not a 409.
+3. **Data model:** this works properly if each direction is its own independent record (a `swipes` collection keyed by sender and receiver) and a connection exists only when both directions are `interested`. It would also close the opposite-direction race from Part 3, because A to B and B to A become separate rows and a match is computed from the pair. The costs are a data-model change, a changed review flow, and a migration of existing requests.
+
+Weaker signals such as response timing and sizes remain, but the feed disappearance is the clear one.
+
+### What I ran and what I learned
+
+- `scripts/seed-users.js` creates 25 fake users and `--clean` removes them and their requests, so the feed has people to show.
+- The three-user shell loop failed the first time with `bash: !Pass#1\: event not found`, followed by three `401` responses. Bash expands `!` inside double quotes, so the login JSON was mangled, no cookie was saved, and the follow-up requests were unauthenticated. Rerunning with the JSON in single quotes fixed it. Lesson: a password containing `!` has to go in single quotes in shell commands.
+- The feed excludes me and everyone I share a request with, uses cursor pagination with `limit + 1`, returns cards without `emailId`, and validates every query parameter as a plain string in a fixed format.
+- The two Part 3 lists use the same pagination, sorted by `_id` so the cursor is stable.
+- `server.js` now handles SIGINT and SIGTERM by closing the server and the database, and exits on unhandled errors so a supervisor can restart a clean process.
+
+### Limitations
+
+- The `$nin` list grows with every interaction. It's fine for thousands of users, but it becomes slow and eventually hits MongoDB's document size limit. A production feed would use an aggregation with a join or a precomputed "seen" set.
+- Ordering is by account age, so there is no ranking by shared skills.
+- The ignore leak described above is still open.
+- Connections are ordered by when the request was created, not when it was accepted, because the cursor needs a unique, stable sort key.

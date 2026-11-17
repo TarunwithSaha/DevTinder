@@ -2,10 +2,10 @@ const User = require("../models/user");
 const ConnectionRequest = require("../models/connectionRequest");
 const AppError = require("../utils/AppError");
 const { publicCard, CARD_FIELDS } = require("../utils/serializers");
+const { buildPage } = require("../utils/pagination");
 
 const SEND_STATUSES = ["interested", "ignored"];
 const REVIEW_STATUSES = ["accepted", "rejected"];
-const LIST_LIMIT = 100;
 
 // Exactly 24 hex characters. (mongoose.isValidObjectId also accepts any
 // 12-character string, which would let odd input through.)
@@ -71,34 +71,48 @@ async function reviewRequest(me, status, requestId) {
   throw new AppError(`This request was already ${existing.status}`, 409);
 }
 
-async function listReceived(me) {
-  const requests = await ConnectionRequest.find({ toUserId: me._id, status: "interested" })
-    .sort({ createdAt: -1 })
-    .limit(LIST_LIMIT)
+// Requests sent TO me that are still waiting for my answer, newest first.
+// The cursor is the request's own id.
+async function listReceived(me, { limit, cursor }) {
+  const filter = { toUserId: me._id, status: "interested" };
+  if (cursor) filter._id = { $lt: cursor };
+
+  const rows = await ConnectionRequest.find(filter)
+    .sort({ _id: -1 })
+    .limit(limit + 1)
     .populate("fromUserId", CARD_FIELDS);
 
-  return requests
+  const { items, nextCursor } = buildPage(rows, limit, (r) => r._id);
+  const requests = items
     .filter((r) => r.fromUserId) // skip requests from users that no longer exist
     .map((r) => ({ requestId: r._id, receivedAt: r.createdAt, from: publicCard(r.fromUserId) }));
+  return { requests, nextCursor };
 }
 
-async function listConnections(me) {
-  const requests = await ConnectionRequest.find({
+// Accepted connections in either direction. Ordered by when the REQUEST was created
+// (not when it was accepted), because the cursor needs a unique, stable sort key.
+async function listConnections(me, { limit, cursor }) {
+  const filter = {
     status: "accepted",
     $or: [{ fromUserId: me._id }, { toUserId: me._id }],
-  })
-    .sort({ updatedAt: -1 })
-    .limit(LIST_LIMIT)
+  };
+  if (cursor) filter._id = { $lt: cursor };
+
+  const rows = await ConnectionRequest.find(filter)
+    .sort({ _id: -1 })
+    .limit(limit + 1)
     .populate("fromUserId", CARD_FIELDS)
     .populate("toUserId", CARD_FIELDS);
 
-  return requests
+  const { items, nextCursor } = buildPage(rows, limit, (r) => r._id);
+  const connections = items
     .map((r) => {
       const iSent = r.fromUserId && r.fromUserId._id.equals(me._id);
       const other = iSent ? r.toUserId : r.fromUserId;
       return other ? { connectionId: r._id, since: r.updatedAt, user: publicCard(other) } : null;
     })
     .filter(Boolean);
+  return { connections, nextCursor };
 }
 
 module.exports = { sendRequest, reviewRequest, listReceived, listConnections };
