@@ -59,6 +59,7 @@ async function reviewRequest(me, status, requestId) {
   // If two reviews arrive at the same moment, the database lets only one of them match.
   const updated = await ConnectionRequest.findOneAndUpdate(
     { _id: requestId, toUserId: me._id, status: "interested" },
+    // { _id: requestId, toUserId: me._id },
     { status },
     { new: true, runValidators: true }
   );
