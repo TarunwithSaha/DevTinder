@@ -48,6 +48,7 @@ function createApp(overrides = {}) {
 
   app.use(helmet());
   app.get("/health", (req, res) => res.json({ status: "ok" }));
+app.get("/", (req, res) => res.redirect("/docs/"));
 
   app.use(makeLimiter(on, limits.global));
   app.use(express.json({ limit: "10kb" }));
